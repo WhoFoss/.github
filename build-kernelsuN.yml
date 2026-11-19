@@ -1,0 +1,211 @@
+name: Build Sapphire Kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+            pngcrush rsync schedtool squashfs-tools xsltproc zip \
+            zlib1g-dev python3 python-is-python3 device-tree-compiler \
+            dwarves
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-sapphire-${{ github.ref_name }}
+          max-size: 2G
+
+      - name: Download AOSP Clang (Android 16)
+        run: |
+          git clone --depth=1 -b android16-release https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/clang
+          CLANG_DIR=$(ls -d $HOME/clang/clang-r* | head -n 1)
+          echo "Pronadjen Clang u: $CLANG_DIR"
+          echo "$CLANG_DIR/bin" >> $GITHUB_PATH
+
+      - name: Clone kernel
+        run: |
+          git clone --depth=1 -b lineage-23.2 \
+            https://github.com/WF-DT-Sapphire/kernel_xiaomi_sapphire kernel
+
+      - name: Integrate KernelSU-Next + SUSFS (GKI 5.15)
+        working-directory: kernel
+        env:
+          # Branch do KernelSU-Next ja com SUSFS e branch do susfs4ksu (patch do kernel).
+          # Se o kernel for android14-5.15, troque para next-susfs-a14-5.15 / gki-android14-5.15.
+          KSU_BRANCH: next-susfs-a13-5.15
+          SUSFS_BRANCH: gki-android13-5.15
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_BRANCH"
+
+          # Lado kernel do SUSFS: arquivos novos + patch nos fontes
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs4ksu"
+          SUSFS_DIR="$RUNNER_TEMP/susfs4ksu/kernel_patches"
+          cp -v "$SUSFS_DIR"/fs/* fs/
+          cp -v "$SUSFS_DIR"/include/linux/* include/linux/
+          PATCH=$(ls "$SUSFS_DIR"/50_add_susfs_in_*.patch | head -n 1)
+          echo "Aplicando $PATCH"
+          patch -p1 --forward < "$PATCH" || { echo "Patch do SUSFS falhou! Arquivos .rej:"; find . -name '*.rej'; exit 1; }
+
+          DEFCONFIG=arch/arm64/configs/vendor/sapphire_defconfig
+          cat <<EOF >> "$DEFCONFIG"
+
+          # KernelSU-Next + SUSFS
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          EOF
+
+      - name: Add Droidspaces support (GKI kABI patch + configs)
+        working-directory: kernel
+        run: |
+          # kABI patch: obrigatorio no GKI, senao as opcoes de IPC causam bootloop
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS "$RUNNER_TEMP/droidspaces"
+          PATCH=$(find "$RUNNER_TEMP/droidspaces" -name '001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch' | head -n 1)
+          [ -n "$PATCH" ] || { echo "Patch kABI do Droidspaces nao encontrado!"; exit 1; }
+          echo "Aplicando $PATCH"
+          patch -p1 < "$PATCH"
+
+          DEFCONFIG=arch/arm64/configs/vendor/sapphire_defconfig
+          cat <<EOF >> "$DEFCONFIG"
+
+          # Droidspaces (GKI)
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_USER_NS=y
+          CONFIG_IP6_NF_NAT=y
+          CONFIG_IP6_NF_TARGET_MASQUERADE=y
+          CONFIG_MACVLAN=y
+          CONFIG_NETFILTER_XT_TARGET_REJECT=y
+          CONFIG_NETFILTER_XT_TARGET_LOG=y
+          CONFIG_NETFILTER_XT_MATCH_RECENT=y
+          CONFIG_IP_SET=y
+          CONFIG_IP_SET_HASH_IP=y
+          CONFIG_IP_SET_HASH_NET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          # NAO ativar CONFIG_CFS_BANDWIDTH nem CONFIG_CGROUP_PIDS: quebram o kABI
+          EOF
+
+      - name: Build kernel (Image only)
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          LLVM: "1"
+          LLVM_IAS: "1"
+          KBUILD_BUILD_USER: whokernel
+          KBUILD_BUILD_HOST: sapphire-build
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          export CC="ccache clang"
+          export CXX="ccache clang++"
+          export HOSTCC="ccache gcc"
+          export HOSTCXX="ccache g++"
+          rm -rf out && mkdir out
+          make O=out vendor/sapphire_defconfig
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "KernelSU nao ficou ativo no .config!"; exit 1; }
+          grep -q '^CONFIG_KPROBES=y' out/.config || { echo "KPROBES nao ficou ativo no .config!"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config || {
+            echo "SUSFS nao ficou ativo no .config!"
+            echo "=== .config: linhas com SUSFS ==="
+            grep -i 'susfs' out/.config || echo "(nenhuma linha)"
+            echo "=== Kconfig que definem KSU_SUSFS ==="
+            grep -rn --include='Kconfig*' 'KSU_SUSFS' . | head -n 20 || true
+            echo "=== KernelSU-Next usado ==="
+            git -C KernelSU-Next branch --show-current || true
+            git -C KernelSU-Next log -1 --oneline || true
+            exit 1
+          }
+          for opt in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS; do
+            grep -q "^CONFIG_${opt}=y" out/.config || { echo "Droidspaces: CONFIG_${opt} nao ficou ativo!"; exit 1; }
+          done
+          make O=out -j$(nproc) Image
+          IMG=out/arch/arm64/boot/Image
+          [ -s "$IMG" ] || { echo "Image nije napravljen!"; exit 1; }
+          echo "FULL_KREL=$(cat out/include/config/kernel.release)" >> $GITHUB_ENV
+          echo "Image size: $(du -h "$IMG" | cut -f1)"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3 anykernel
+          cd anykernel
+          rm -rf .git .github README.md *placeholder*
+          # ASCII crtež je u fajlu "banner" — isprazni ga, ne briši
+          : > banner
+          cp ../kernel/out/arch/arm64/boot/Image ./Image
+          cat <<EOF > anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+          properties() { '
+          kernel.string=Angel Kernel ${{ env.FULL_KREL }}
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          do.check_boot_version=0
+          device.name1=sapphire
+          device.name2=sapphiren
+          '; } # end properties
+          block=boot
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          no_magisk_check=1
+          . tools/ak3-core.sh
+          split_boot
+          if [ -f "\$SPLITIMG/ramdisk.cpio" ]; then
+              unpack_ramdisk
+              write_boot
+          else
+              flash_boot
+          fi
+          ui_print " " "Angel Kernel successfully flashed!" " "
+          EOF
+          ZIP_NAME="AngelKernel_sapphire_$(date +%Y%m%d)_${FULL_KREL}.zip"
+          zip -r9 "../$ZIP_NAME" . >/dev/null
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AngelKernel-sapphire
+          path: AngelKernel_sapphire_*.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }} - ${{ env.FULL_KREL }}
+          body: |
+            Automatski build za Sapphire/SapphireN
+            Kernel: ${{ env.FULL_KREL }}
+            Bazirano na: lineage-23.2
+          files: AngelKernel_sapphire_*.zip
